@@ -97,7 +97,16 @@
  *
  * Regenerar la imagen desde las fotos (reloj2.png, esfera2.jpg):
  *      python3 prep_img.py reloj2.png esfera2.jpg IMGRLE.H
+ *
+ * Mejoras v2 (C puro, sin ASM ni pragma aux):
+ *   - Tablas SIN256/COS256 de 256 entradas (lookup O(1)).
+ *   - Fraccion de tic via latch del PIT canal 0 (segundero sub-tick).
+ *   - Tabla fila340[] de offsets de fila del dial (sin IMUL por fila).
+ *   - Franjas sucias con margen 1 px.
+ *   - Speaker apagado por delta de tics.
+ *   - VGA256WaitVRetrace ya tiene timeout en vga256.c mejorado.
  */
+
 
 #include <string.h>   /* memcpy, memset                 */
 #include <conio.h>    /* cputs (errores), inp/outp      */
@@ -200,6 +209,43 @@ static const int SEN[65] = {
     251,  252,  253,  254,  255,  255,  256,  256,  256
 };
 
+/* Tablas de 256 angulos + offsets de fila del dial (sin IMUL). */
+static int SIN256[256];
+static int COS256[256];
+static unsigned fila340[DIAL_H];
+
+static void init_sincos(void)
+{
+    unsigned a;
+    unsigned o = 0;
+    int f;
+    for (a = 0; a < 256u; a++) {
+        unsigned q = (a >> 6) & 3u;
+        unsigned i = a & 63u;
+        int s;
+        if (q == 0u)      s =  SEN[i];
+        else if (q == 1u) s =  SEN[64u - i];
+        else if (q == 2u) s = -SEN[i];
+        else              s = -SEN[64u - i];
+        SIN256[a] = s;
+        {
+            unsigned ca = (64u - a) & 255u;
+            unsigned cq = (ca >> 6) & 3u;
+            unsigned ci = ca & 63u;
+            if (cq == 0u)      COS256[a] =  SEN[ci];
+            else if (cq == 1u) COS256[a] =  SEN[64u - ci];
+            else if (cq == 2u) COS256[a] = -SEN[ci];
+            else               COS256[a] = -SEN[64u - ci];
+        }
+    }
+    for (f = 0; f < DIAL_H; f++) {
+        fila340[f] = o;
+        o += (unsigned)DIAL_W;
+    }
+}
+
+#define OFF340(y) (fila340[(y)])
+
 /* Digitos 5x7 para la fecha.  Bit 0x80 = pixel izquierdo. */
 static const unsigned char FUENTE[10][DIG_ALTO] = {
     { 0x70, 0x88, 0x98, 0xA8, 0xC8, 0x88, 0x70 },  /* 0 */
@@ -232,8 +278,11 @@ static int act;
 static int *cmin = suc_min[0];
 static int *cmax = suc_max[0];
 
+/* margen 1 px contra rastros en diagonales */
 static void sucia(int x1, int x2, int y)
 {
+    if (x1 > 0) x1--;
+    if (x2 < DIAL_W - 1) x2++;
     if (x1 < cmin[y]) cmin[y] = x1;
     if (x2 > cmax[y]) cmax[y] = x2;
 }
@@ -258,7 +307,7 @@ static void linea_h(int x1, int x2, int y, unsigned char c)
     if (x2 >= DIAL_W) x2 = DIAL_W - 1;
     if (x1 > x2) return;
     sucia(x1, x2, y);
-    memset(MARCO + (size_t)y * DIAL_W + x1, c, (size_t)(x2 - x1 + 1));
+    memset(MARCO + OFF340(y) + (unsigned)x1, c, (size_t)(x2 - x1 + 1));
 }
 
 /* poligono convexo relleno por barrido de scanlines, recortado al
@@ -328,18 +377,15 @@ static void disco(int cx, int cy, int r, unsigned char c)
     }
 }
 
-/* seno/coseno de "ang" en 1/256 de vuelta (0 = las 12, horario) */
 static int sen256(unsigned a)
 {
-    unsigned q = (a >> 6) & 3u;
-    unsigned i = a & 63u;
-    if (q == 0u) return  SEN[i];
-    if (q == 1u) return  SEN[64u - i];
-    if (q == 2u) return -SEN[i];
-    return -SEN[64u - i];
+    return SIN256[a & 255u];
 }
 
-#define cos256(a) sen256(64u - (a))
+static int cos256(unsigned a)
+{
+    return COS256[a & 255u];
+}
 
 /* punto del dial: s y c son seno y coseno (Q8) del angulo de la aguja,
    rr va a lo largo de la aguja (negativo = cola) y k es perpendicular.
@@ -368,7 +414,7 @@ static void linea(int x0, int y0, int x1, int y1, unsigned char c)
     sy = (y0 < y1) ? 1 : -1;
     paso = (sy > 0) ? DIAL_W : -DIAL_W;
     err = dx - dy;
-    p = MARCO + (size_t)y0 * DIAL_W + x0;
+    p = MARCO + OFF340(y0) + (unsigned)x0;
     for (;;) {
         p[0] = c;
         p[1] = c;
@@ -662,7 +708,7 @@ static void callar(void)
 static void franja_salida(void)
 {
     static const char MENSAJE[] =
-        " ROLEX386 v1 (c) Copyright 2026 by Javier Guti\x82rrez Chamorro (Guti) ";
+        " ROLEX386 v2 (c) Copyright 2026 by Javier Guti\x82rrez Chamorro (Guti) ";
     volatile unsigned short *v = (volatile unsigned short *)0xB8000ul;
     const char *p = MENSAJE;
     int i;
@@ -821,20 +867,40 @@ static void volcar(void)
    devuelve el PULSO del tic-tac: t256 >> 6, o sea 4 por segundo (el
    ritmo de un automatico a 14.400 alternancias/hora; los de 28.800
    dan 8), que suena siempre que el pulso cambia. */
+static unsigned pit_frac(void)
+{
+    unsigned lo, hi, c;
+    outp(0x43, 0x00);
+    lo = (unsigned)inp(0x40);
+    hi = (unsigned)inp(0x40);
+    c = (hi << 8) | lo;
+    return (unsigned)(0xFFFFu - c);
+}
+
 static void angulos(unsigned long tk, unsigned *a_h, unsigned *a_m,
                     unsigned *a_s, unsigned long *pulso)
 {
-    unsigned long t2k = tk * 2000UL;       /* s: MUL de 32 bits del 386 */
-    unsigned long s = t2k / 36413UL;                     /* s desde las 0h */
-    unsigned long t256 = (s << 8)
-                       + (((t2k - s * 36413UL) << 8) / 36413UL);
-    unsigned long vs = t256 / 60UL;      /* vueltas del segundero */
-    unsigned long vm = vs / 60UL;        /* idem minutero          */
+    unsigned long t2k = tk * 2000UL;
+    unsigned long s = t2k / 36413UL;
+    unsigned long sub = ((t2k - s * 36413UL) << 8) / 36413UL;
+    {
+        unsigned pf = pit_frac();
+        sub += ((unsigned long)pf * 14UL) >> 16;
+        if (sub > 255UL) {
+            sub -= 256UL;
+            s++;
+        }
+    }
+    {
+        unsigned long t256 = (s << 8) + sub;
+        unsigned long vs = t256 / 60UL;
+        unsigned long vm = vs / 60UL;
 
-    *a_s = (unsigned)vs & 255u;
-    *a_m = (unsigned)vm & 255u;
-    *a_h = ((unsigned)vm / 12u) & 255u;
-    *pulso = t256 >> 6;
+        *a_s = (unsigned)vs & 255u;
+        *a_m = (unsigned)vm & 255u;
+        *a_h = ((unsigned)vm / 12u) & 255u;
+        *pulso = t256 >> 6;
+    }
 }
 
 int main(void)
@@ -866,6 +932,7 @@ int main(void)
 
     /* paleta ANTES de blitear la foto, para que no asome ni un frame
        con la paleta por defecto del VBE */
+    init_sincos();
     pon_paleta();
 
     montar();
@@ -898,14 +965,18 @@ int main(void)
         }
         tk_ant = tk;
         angulos(tk, &a_h, &a_m, &a_s, &pulso);
-        if (sonando) {                         /* altavoz: apaga el tic anterior */
+        if (sonando && (tk - (unsigned long)sonando) >= 1UL) {
             callar();
             sonando = 0;
         }
         if (pulso != p_pulso) {                /* pulso nuevo: tic-tac */
             p_pulso = pulso;
-            if (opl) tic_tac(pulso);            /* FM: click con caida propia */
-            else { pitido((unsigned)pulso); sonando = 1; }  /* altavoz: ~55 ms */
+            if (opl) tic_tac(pulso);
+            else {
+                pitido((unsigned)pulso);
+                sonando = (int)tk;
+                if (sonando == 0) sonando = 1;
+            }
         }
         if (a_h == p_h && a_m == p_m && a_s == p_s) continue;  /* igual */
         p_h = a_h; p_m = a_m; p_s = a_s;
