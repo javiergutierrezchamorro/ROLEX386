@@ -75,9 +75,11 @@
  * la VRAM de texto (franja azul de 80 columnas en la fila 0, texto
  * blanco, cursor en (1, 0)): ni cputs ni int 29h.
  *
- * Tic-tac FM de verdad: si hay un YM3812 (Adlib o Sound Blaster) en
- * 388h, cuatro veces por segundo sale un click (el tic algo mas agudo que el
- * tac); si no hay chip, el reloj queda mudo y no se toca el puerto.
+ * Tic-tac: si hay un YM3812 (Adlib o Sound Blaster) en 388h, cuatro
+ * veces por segundo sale un click FM (el tic algo mas agudo que el
+ * tac); si no hay chip, FALLBACK al altavoz del PC (canal 2 del PIT
+ * 8253 al puerto 42h y bits 0/1 del 61h, ~55 ms de tono por tic del
+ * BIOS), como en ROLEX.C.  Nada de quedarse mudo.
  *
  * El segundero pinta DOS pixeles de ancho: sobre los pixeles finos de
  * 640x480, el hilo de un pixel quedaria casi invisible.  El resto de
@@ -535,9 +537,10 @@ static int lee_tecla(void)
 
 /* Un YM3812 (OPL2) responde en 388h/389h tanto en el Adlib como en
    cualquier Sound Blaster.  El tic-tac son dos clics alternos, un
-   click por segundo: un solo canal FM (el 0) preparado con ataque
-   inmediato y caida y salida rapidisimas, de modo que cada key-on ES
-   el click; el tic es algo mas agudo que el tac.  Sin chip, mudo. */
+   click por cuarto de segundo: un solo canal FM (el 0) preparado con
+   ataque inmediato y caida y salida rapidisimas, de modo que cada
+   key-on ES el click; el tic es algo mas agudo que el tac.  Sin chip,
+   FALLBACK al altavoz del PC (pitido/callar de mas abajo). */
 #define OPL_REG 0x388u
 #define OPL_DAT 0x389u
 
@@ -615,6 +618,36 @@ static void opl_silencio(void)
     opl_escribe(0xB0, 0x00);              /* key off del canal 0 */
     opl_escribe(0x04, 0x60);              /* reset de los timers */
     opl_escribe(0x04, 0x80);
+}
+
+/* ==================== tic-tac del altavoz (FALLBACK) ==================== */
+
+/* Si no hay YM3812, el tic-tac sale por el altavoz del PC: canal 2
+   del PIT (8253/8254) al puerto 42h y bits 0 (puerta) y 1 (altavoz)
+   del 61h.  Sin esperas activas ni interrupciones: el pitido se
+   enciende al cruzar cada cuarto de segundo (angulos() ya calcula
+   t256; el contador es t256 >> 6) y se apaga EN EL TIC SIGUIENTE del
+   BIOS: ~55 ms de tono, ~195 ms de silencio.  Tic y tac alternan la
+   frecuencia (paridad del contador).  Los divisores del PIT son
+   1193182 / frecuencia: van como CONSTANTES de 16 bits (lo primero el
+   byte bajo, luego el alto, tras el comando B6h).  En un 386 la
+   division seria casi gratis, pero mantener las constantes deja el
+   codigo identico al del ROLEX.C de 8086 y no cambia nada. */
+static void pitido(unsigned cuarto)
+{
+    outp(0x43, 0xB6);                       /* canal 2, modo 3, lo/hi */
+    if (cuarto & 1u) {                      /* tac: 900 Hz            */
+        outp(0x42, 0x2E); outp(0x42, 0x05); /* 1326 = 1193182/900    */
+    } else {                                /* tic: 1000 Hz           */
+        outp(0x42, 0xA9); outp(0x42, 0x04); /* 1193 = 1193182/1000   */
+    }
+    outp(0x61, inp(0x61) | 0x03);           /* puerta del canal 2 + altavoz */
+}
+
+/* apaga el altavoz dejando intactos los demas bits del puerto 61h */
+static void callar(void)
+{
+    outp(0x61, inp(0x61) & ~0x03);
 }
 
 /* ==================== salida: franja en la VRAM de texto ==================== */
@@ -810,6 +843,7 @@ int main(void)
     unsigned a_h, a_m, a_s;
     unsigned p_h = 0xFFFFu, p_m = 0xFFFFu, p_s = 0xFFFFu;  /* ya dibujados */
     int modo, opl;
+    int sonando = 0;                    /* 1 = el altavoz sigue encendido (fallback) */
 
     if (!VBE_Init()) {
         cputs("ROLEX386: no hay BIOS SVGA VESA (VBE).\r\n");
@@ -838,7 +872,9 @@ int main(void)
 
     pinta_fecha(lee_fecha());
 
-    /* tic-tac: deteccion clasica de OPL2; sin chip, mudo */
+    /* tic-tac: PRIORIDAD FM.  Si hay OPL2 sale por FM; si no,
+       FALLBACK al altavoz del PC (pitido/callar).  opl decide una
+       sola vez y queda fijo para todo el bucle. */
     opl = opl_presente();
     if (opl) opl_canal();
 
@@ -849,7 +885,7 @@ int main(void)
         if (tk == tk_ant) continue;            /* mismo tic: nada que hacer */
         while (hay_tecla()) {                  /* el teclado, una vez por tic */
             if (lee_tecla() == 27) {     /* ESC -> salir */
-                if (opl) opl_silencio();
+                if (opl) opl_silencio(); else callar();   /* que no quede sonido */
                 VBE_SetMode(3, 0, 0);
                 VBE_Done();
                 franja_salida();         /* franja azul/blanco en la fila 0 */
@@ -862,9 +898,14 @@ int main(void)
         }
         tk_ant = tk;
         angulos(tk, &a_h, &a_m, &a_s, &pulso);
+        if (sonando) {                         /* altavoz: apaga el tic anterior */
+            callar();
+            sonando = 0;
+        }
         if (pulso != p_pulso) {                /* pulso nuevo: tic-tac */
-            if (opl) tic_tac(pulso);
             p_pulso = pulso;
+            if (opl) tic_tac(pulso);            /* FM: click con caida propia */
+            else { pitido((unsigned)pulso); sonando = 1; }  /* altavoz: ~55 ms */
         }
         if (a_h == p_h && a_m == p_m && a_s == p_s) continue;  /* igual */
         p_h = a_h; p_m = a_m; p_s = a_s;
