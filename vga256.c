@@ -372,6 +372,7 @@ char * VBE_GetVideoPtr (short mode)
 {
 	struct VBE_ModeInfoBlock ModeInfo;
 	if ( mode==0x13 ) return (char *) 0xa0000;
+	if ( VBE_Controller_Info_Pointer == NULL ) return NULL;   /* guard: TotalMemory needs Init */
 	/* Reuse the existing LFB mapping when the mode did not change */
 	if ((mode == last_mapped_mode) && (LastPhysicalMapping != NULL)) {
 		return (char *) LastPhysicalMapping;
@@ -632,42 +633,54 @@ void VBE_Done (void)
  * macros or static __inline in vga256.h (no call overhead). */
 
 /*------------------------------------------------------------------------------------------------------- */
+/* Port I/O without conio: used by WaitVRetrace (status register 0x3DA). */
+static unsigned char VGA256InPort(unsigned short port);
+#pragma aux VGA256InPort = \
+"in al, dx" \
+parm [dx] \
+value [al] \
+modify exact [al];
+
+/*------------------------------------------------------------------------------------------------------- */
+/* Fast byte-pattern fill: builds eax = color*0x01010101 and uses rep stosd
+ * for the body plus a byte tail. On a 386 this beats a byte-wise memset
+ * roughly 3:1 for typical scanline lengths. */
+void _VGA256Fill(void *pDest, unsigned char color, unsigned int len);
+#pragma aux _VGA256Fill = \
+"cld" \
+"mov ah, al" \
+"mov bx, ax" \
+"shl eax, 16" \
+"mov ax, bx" \
+"mov edx, ecx" \
+"shr ecx, 2" \
+"rep stosd" \
+"and edx, 3" \
+"mov ecx, edx" \
+"rep stosb" \
+parm [edi] [al] [ecx] \
+modify exact [eax ebx ecx edx edi];
+
+/*------------------------------------------------------------------------------------------------------- */
 void VGA256FillBox(void *pVideo, unsigned int x, unsigned int y, unsigned int width, unsigned int height, unsigned int color)
 {
-	unsigned int h, n;
+	unsigned int h;
 	unsigned char *offset = (unsigned char *) &VGA256OFFSET(pVideo, x, y);
 	unsigned char c = (unsigned char)color;
-	unsigned int c4;
 
 	if ((width == 0) || (height == 0))
 		return;
 
-	/* Full-width fills are contiguous rows: one single memset */
+	/* Full-width fills are contiguous rows: one single fill */
 	if ((x == 0) && (width == VGA256_WIDTH) && (VGA256_Pitch == VGA256_WIDTH))
 	{
-		memset(&VGA256OFFSET(pVideo, 0, y), c, (size_t) VGA256_WIDTH * height);
-		return;
-	}
-
-	/* Dword fill when dest and width are 4-byte aligned: ~4x fewer stores */
-	if ((((unsigned)offset & 3) == 0) && ((width & 3) == 0))
-	{
-		c4 = c * 0x01010101u;
-		n = width >> 2;
-		for (h = 0; h < height; h++)
-		{
-			unsigned int *d = (unsigned int *)offset;
-			unsigned int i;
-			for (i = 0; i < n; i++)
-				d[i] = c4;
-			offset += VGA256_Pitch;
-		}
+		_VGA256Fill(offset, c, VGA256_WIDTH * height);
 		return;
 	}
 
 	for (h = 0; h < height; h++)
 	{
-		memset(offset, c, width);
+		_VGA256Fill(offset, c, width);
 		offset += VGA256_Pitch;
 	}
 }
@@ -846,7 +859,7 @@ void VGA256GetImage(void* pVideo, void* pcDest, unsigned int piX, unsigned int p
 void VGA256ScaleImage(unsigned char* pDest, unsigned char* pSource, unsigned int widthd, unsigned int heightd, unsigned int widths, unsigned int heights)
 {
 	unsigned int x, y;
-	unsigned int xpos, ypos, xstep, ystep, xstep2;
+	unsigned int xpos, ypos, xstep, ystep;
 	unsigned int yi, last_yi;
 	unsigned char* pRow;
 
@@ -862,7 +875,6 @@ void VGA256ScaleImage(unsigned char* pDest, unsigned char* pSource, unsigned int
 
 	xstep = (widths << 16) / widthd;
 	ystep = (heights << 16) / heightd;
-	xstep2 = xstep << 1;
 	ypos = 0;
 	last_yi = 0;
 	pRow = pSource;
@@ -1790,9 +1802,11 @@ int VGA256LoadBMP(const char* filename, unsigned char* dest, unsigned char* pal)
 						memset(&pal[colors * 3], 0, (256 - colors) * 3);
 					}
 				}
-				else
+				else if (dest == NULL)
 				{
-					res = -2;   /* Palette read failed */
+					/* Palette was the only requested data: report the failure.
+					 * With dest != NULL the image decode below decides the result. */
+					res = -2;
 				}
 			}
 			if (dest)
@@ -2454,4 +2468,3 @@ const unsigned char VGA256Font[] =
 	0x00, 0x00, 0x7C, 0x7C, 0x7C, 0x7C, 0x00, 0x00,	// Char 254 (.)
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x7E, 0x00	// Char 255 (.)
 };
-

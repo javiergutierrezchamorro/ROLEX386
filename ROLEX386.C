@@ -48,6 +48,17 @@
  *     la union de las franjas viejas y nuevas.
  *   - La fecha se "cocina" UNA VEZ en la esfera limpia (y se recocina
  *     al cruzar medianoche, marcando toda la esfera como sucia).
+ *   - LUPA de la fecha (el "cyclops" de la ventanita de las 3h): una
+ *     lente de 36x25 pixeles que AUMENTA 5/2 (2,5x, como la de Rolex)
+ *     lo que hay debajo.  Bajo ella la esfera lleva la fecha a escala 1
+ *     (digitos 5x7) y la lente la agranda por muestreo con dos tablas
+ *     de indices (un acceso por pixel, sin multiplicar).  Esa imagen
+ *     ampliada se cocina tambien en la esfera limpia, asi que sin agujas
+ *     cerca no cuesta NADA por fotograma.  Cuando el minutero o el
+ *     segundero pasan por la lente se recompone solo ese rectangulo: se
+ *     restaura desde la esfera y encima de la fecha se pintan las
+ *     agujas ensanchadas 5/2 (vectorial, recortadas al interior de la
+ *     lente y con el mismo eje que fuera), con el aro por encima.
  *   - ANTI-PARPADEO: el fotograma se compone en RAM y solo se vuelca
  *     tras el retrazo vertical (VGA256WaitVRetrace).
  * Se sueltan en cambio las micro-optimizaciones de 8086 (seno y raiz
@@ -99,8 +110,8 @@
  *      python3 prep_img.py reloj2.png esfera2.jpg IMGRLE.H
  *
  * Mejoras v2 (C puro, sin ASM ni pragma aux):
- *   - Tablas SIN256/COS256 de 256 entradas (lookup O(1)).
- *   - Fraccion de tic via latch del PIT canal 0 (segundero sub-tick).
+ *   - Tabla SIN256[] de 320 entradas (lookup O(1)): el coseno es la
+ *     misma tabla desplazada 64 (cos a = SIN256[a + 64]), sin mascaras.
  *   - Tabla fila340[] de offsets de fila del dial (sin IMUL por fila).
  *   - Franjas sucias con margen 1 px.
  *   - Speaker apagado por delta de tics.
@@ -163,16 +174,49 @@
 #define DIG_W    5
 #define DIG_ALTO 7
 
+/* LUPA de la fecha (coords del dial).  La lente es un rectangulo
+   LUP_W x LUP_H centrado en la ventanita que AUMENTA 5/2: solo ve un
+   trozo de LUP_SW x LUP_SH pixeles de la esfera (el 2/5 central,
+   redondeado hacia arriba), justo el tamano de dos digitos 5x7 a
+   escala 1.  LUP_R* es el rectangulo con el aro de cristal (un pixel
+   por fuera de la lente). */
+#define LUP_W    36
+#define LUP_H    25
+#define LUP_X0   (VEN_XL + (VEN_ANCHO - LUP_W) / 2)
+#define LUP_Y0   (VEN_YL + (VEN_ALTO - LUP_H) / 2)
+#define LUP_RX0  (LUP_X0 - 1)
+#define LUP_RY0  (LUP_Y0 - 1)
+#define LUP_RW   (LUP_W + 2)
+#define LUP_RH   (LUP_H + 2)
+#define LUP_RX1  (LUP_RX0 + LUP_RW - 1)
+#define LUP_RY1  (LUP_RY0 + LUP_RH - 1)
+#define LUP_SW   15                          /* (LUP_W * 2 + 4) / 5   */
+#define LUP_SH   10                          /* LUP_H * 2 / 5         */
+#define LUP_SX0  (LUP_X0 + LUP_W / 2 - LUP_SW / 2)
+#define LUP_SY0  (LUP_Y0 + LUP_H / 2 - LUP_SH / 2)
+
+/* hasta donde llega, fuera de la lente, una aguja cuya imagen AMPLIADA
+   toca la lente: el semiancho de la aguja mas ancha ampliada (15) por
+   el peor caso en diagonal (1,42) */
+#define LUP_M    24
+
+/* digitos de la fecha a escala 1 dentro de la fuente de la lente */
+#define FEC_X1   ((LUP_SW - DIG_W + 1) / 2)              /* un digito   */
+#define FEC_X2   ((LUP_SW - (2 * DIG_W + 1) + 1) / 2)    /* dos digitos */
+#define FEC_Y    ((LUP_SH - DIG_ALTO + 1) / 2)
+
 /* indices fijos de la paleta (los mismos que fija prep_img.py) */
 #define C_OSC 250           /* acero oscuro (bordes de las agujas)   */
 #define C_CLA 252           /* acero claro (cuerpo)                   */
 #define C_HI  253           /* acero brillo (faceta central)          */
-#define C_NEG 254           /* negro (digitos de la fecha)            */
-#define C_BLA 255           /* blanco (interior de la ventana)        */
+#define C_NEG 0             /* negro (digitos de la fecha)            */
+#define C_ARO1 46           /* aro de la lupa: arriba e izquierda     */
+#define C_ARO2 34           /* aro de la lupa: abajo y derecha        */
 
 /* comprobaciones de la cabecera generada (en compilacion, sin coste):
    la franja cabe en el campo, el segundero se dibuja sin recortar (y
-   pinta DOS pixeles de ancho, de ahi el +2) y la fecha sin guardas */
+   pinta DOS pixeles de ancho, de ahi el +2) y la lupa cabe en el dial,
+   tapa la ventanita y ve una fuente que contiene los dos digitos */
 #if (STRIP_X + STRIP_W > CAMPO_W) || (STRIP_Y + TIRA_H > CAMPO_H)
 #error La franja RLE no cabe en el campo 640x480
 #endif
@@ -182,22 +226,33 @@
 #if (DIAL_W & 3) || (DIAL_XF & 3) || (VGA256_WIDTH & 3)
 #error Las franjas se copian alineadas a dword: DIAL_W, DIAL_XF y el ancho de pantalla deben ser multiplos de 4
 #endif
-#if (VEN_ANCHO < 2 * (2 * DIG_W) + 2) || (VEN_ALTO < 2 * DIG_ALTO)
-#error La ventanita de la fecha no cabe para dos digitos
+#if (LUP_RX0 < 0) || (LUP_RX1 >= DIAL_W) || (LUP_RY0 < 0) || (LUP_RY1 >= DIAL_H)
+#error La lupa de la fecha no cabe en el dial
+#endif
+#if (LUP_W < VEN_ANCHO + 4) || (LUP_H < VEN_ALTO + 4)
+#error La lupa no tapa la ventanita de la fecha
+#endif
+#if ((2 * (LUP_W - 1) + 1) / 5 >= LUP_SW) || ((2 * (LUP_H - 1) + 1) / 5 >= LUP_SH)
+#error LUP_SW x LUP_SH no cubre lo que ve la lente (aumento 5/2)
+#endif
+#if (LUP_SW < 2 * DIG_W + 1) || (LUP_SH < DIG_ALTO)
+#error La fuente de la lente no cabe para dos digitos
 #endif
 
 /* ============================ datos ============================ */
 
 /* buferes de trabajo: marco + esfera limpia (2 x 115.600) en un unico
    bloque estatico, alineado a dword por ser de unsigned long (DIAL_TAM
-   es multiplo de 4): nada de malloc ni de ruta de error */
+   es multiplo de 4): nada de malloc ni de ruta de error.  MARCO y
+   ESFERA son macros (direcciones constantes) y no punteros: el codigo
+   no tiene que cargar una variable en cada uso */
 static unsigned long almacen[(2 * DIAL_TAM) / 4];
-static unsigned char *MARCO  = (unsigned char *)almacen;              /* fotograma compuesto (340x340) */
-static unsigned char *ESFERA = (unsigned char *)almacen + DIAL_TAM;   /* esfera limpia (base)          */
+#define MARCO  ((unsigned char *)almacen)    /* fotograma compuesto (340x340) */
+#define ESFERA (MARCO + DIAL_TAM)            /* esfera limpia (base)          */
 static unsigned char *pVideo;  /* framebuffer lineal de la vga256   */
 
 /* Tabla de seno Q8: SEN[k] = round(sin(k*2*pi/256)*256), k = 0..64;
-   el resto por simetria (sen256). */
+   el resto por simetria (init_sincos). */
 static const int SEN[65] = {
       0,    6,   13,   19,   25,   31,   38,   44,
      50,   56,   62,   68,   74,   80,   86,   92,
@@ -209,39 +264,27 @@ static const int SEN[65] = {
     251,  252,  253,  254,  255,  255,  256,  256,  256
 };
 
-/* Tablas de 256 angulos + offsets de fila del dial (sin IMUL). */
-static int SIN256[256];
-static int COS256[256];
+/* Tabla de 256 + 64 entradas: SIN256[a] es el seno y SIN256[a + 64] el
+   coseno (Q8) del angulo a, en 1/256 de vuelta (a < 256, sin mascaras ni
+   segunda tabla); y offsets de fila del dial (sin IMUL). */
+static int SIN256[256 + 64];
 static unsigned fila340[DIAL_H];
 
 static void init_sincos(void)
 {
-    unsigned a;
+    int k;
     unsigned o = 0;
-    int f;
-    for (a = 0; a < 256u; a++) {
-        unsigned q = (a >> 6) & 3u;
-        unsigned i = a & 63u;
-        int s;
-        if (q == 0u)      s =  SEN[i];
-        else if (q == 1u) s =  SEN[64u - i];
-        else if (q == 2u) s = -SEN[i];
-        else              s = -SEN[64u - i];
-        SIN256[a] = s;
-        {
-            unsigned ca = (64u - a) & 255u;
-            unsigned cq = (ca >> 6) & 3u;
-            unsigned ci = ca & 63u;
-            if (cq == 0u)      COS256[a] =  SEN[ci];
-            else if (cq == 1u) COS256[a] =  SEN[64u - ci];
-            else if (cq == 2u) COS256[a] = -SEN[ci];
-            else               COS256[a] = -SEN[64u - ci];
-        }
+
+    for (k = 0; k <= 64; k++) {          /* el resto, por simetria */
+        SIN256[k]       =  SEN[k];
+        SIN256[128 - k] =  SEN[k];
+        SIN256[128 + k] = -SEN[k];
+        SIN256[256 - k] = -SEN[k];
     }
-    for (f = 0; f < DIAL_H; f++) {
-        fila340[f] = o;
-        o += (unsigned)DIAL_W;
-    }
+    for (k = 256; k < 256 + 64; k++)     /* cos(a) = sen(a + 64) */
+        SIN256[k] = SIN256[k - 256];
+    for (k = 0; k < DIAL_H; k++, o += DIAL_W)
+        fila340[k] = o;
 }
 
 #define OFF340(y) (fila340[(y)])
@@ -298,13 +341,16 @@ static void sucio_todo(void)
     }
 }
 
+static int clip_x0 = 0, clip_x1 = DIAL_W - 1;   /* ventana de recorte: todo el dial */
+static int clip_y0 = 0, clip_y1 = DIAL_H - 1;   /* (la lupa la estrecha a su interior) */
+
 static void linea_h(int x1, int x2, int y, unsigned char c)
 {
     int t;
-    if (y < 0 || y >= DIAL_H) return;
+    if (y < clip_y0 || y > clip_y1) return;
     if (x1 > x2) { t = x1; x1 = x2; x2 = t; }
-    if (x1 < 0) x1 = 0;
-    if (x2 >= DIAL_W) x2 = DIAL_W - 1;
+    if (x1 < clip_x0) x1 = clip_x0;
+    if (x2 > clip_x1) x2 = clip_x1;
     if (x1 > x2) return;
     sucia(x1, x2, y);
     memset(MARCO + OFF340(y) + (unsigned)x1, c, (size_t)(x2 - x1 + 1));
@@ -375,16 +421,6 @@ static void disco(int cx, int cy, int r, unsigned char c)
         if (dy != 0)
             linea_h(cx - h, cx + h, cy - dy, c);
     }
-}
-
-static int sen256(unsigned a)
-{
-    return SIN256[a & 255u];
-}
-
-static int cos256(unsigned a)
-{
-    return COS256[a & 255u];
 }
 
 /* punto del dial: s y c son seno y coseno (Q8) del angulo de la aguja,
@@ -461,7 +497,7 @@ static void baston(int s, int c, int r1, int cola, int hw, unsigned char col)
    320x200 era encogerse uno. */
 static void baston2(unsigned ang, int r1, int cola, int hw)
 {
-    int s = sen256(ang), c = cos256(ang);
+    int s = SIN256[ang], c = SIN256[ang + 64];
     baston(s, c, r1, cola, hw, C_OSC);
     if (hw >= 4) baston(s, c, r1 - 2, cola - 2, hw - 2, C_HI);
     if (hw >= 6) baston(s, c, r1 - 4, cola - 4, hw - 4, C_CLA);
@@ -471,7 +507,7 @@ static void baston2(unsigned ang, int r1, int cola, int hw)
    contrapeso circular) */
 static void segundero(unsigned ang)
 {
-    int s = sen256(ang), c = cos256(ang);
+    int s = SIN256[ang], c = SIN256[ang + 64];
     int xa, ya, xb, yb;
     punto(s, c, -COL_S, 0, &xa, &ya);
     punto(s, c,  R_AG_S, 0, &xb, &yb);
@@ -486,46 +522,151 @@ static void centro(void)
     disco(DCX, DCY, CEN_PN, C_OSC);
 }
 
-/* ==================== fecha cocinada en la esfera ==================== */
+/* ==================== lupa y fecha cocinadas en la esfera ==================== */
 
-/* un digito 5x7 a 2x dentro de la ventanita, directo en la esfera limpia
-   (sin recorte ni franjas: pinta_fecha marca toda la esfera sucia) */
-static void digito(int x, int y, int v)
+/* La fuente de la lente es el trozo de esfera de LUP_SW x LUP_SH pixeles
+   que hay debajo de ella, a escala 1.  lup_foto guarda el fondo de la
+   ventanita tal como sale de la foto (sin fecha) y lup_fuente le suma la
+   fecha del dia.  lup_cx / lup_cy dicen de que columna / fila de la
+   fuente sale cada columna / fila de la lente (lup_cy ya multiplicado
+   por LUP_SW): el aumento 5/2 hace que cada pixel de la fuente salga 2
+   o 3 veces, y con las tablas cada pixel de la lente es UN acceso. */
+static unsigned char lup_foto[LUP_SW * LUP_SH];
+static unsigned char lup_fuente[LUP_SW * LUP_SH];
+static unsigned char lup_cx[LUP_W];
+static unsigned char lup_cy[LUP_H];
+
+/* destino i -> fuente (2i+1)/5: se toma el centro del pixel de la lente
+   (i + 1/2) por 2/5; el numerador va de 2 en 2 y se lleva el cociente
+   por sumas, sin dividir */
+static void init_lupa(void)
 {
-    const unsigned char *g = FUENTE[v];
-    unsigned char *d = ESFERA + (size_t)y * DIAL_W + x;
-    unsigned char m;
-    int f, b;
+    int i, q = 0, r = 1;
+    unsigned o = 0;
 
-    for (f = 0; f < DIG_ALTO; f++) {
-        unsigned char bits = g[f];
-        for (b = 0, m = 0x80; b < DIG_W; b++, m >>= 1)
-            if (bits & m) { d[2 * b] = C_NEG; d[2 * b + 1] = C_NEG; }
-        memcpy(d + DIAL_W, d, 2 * DIG_W);    /* fila gemela del 2x */
-        d += 2 * DIAL_W;
+    for (i = 0; i < LUP_W; i++) {
+        lup_cx[i] = (unsigned char)q;
+        r += 2;
+        if (r >= 5) { r -= 5; q++; }
+    }
+    for (i = 0, r = 1; i < LUP_H; i++) {
+        lup_cy[i] = (unsigned char)o;
+        r += 2;
+        if (r >= 5) { r -= 5; o += LUP_SW; }
     }
 }
 
-/* dia del mes en la ventanita de las 3 (sin cero inicial), centrado en
-   la abertura, a 2x.  Se cocina UNA VEZ sobre la esfera limpia y a
-   medianoche se vuelve a cocinar con el dia nuevo. */
+/* pinta el interior de la lente en el dial (ESFERA o MARCO) agrandando
+   la fuente.  Las filas de la lente que salen de la misma fila de la
+   fuente (la mitad) se copian de la anterior */
+static void lente(unsigned char *dial, const unsigned char *fuente)
+{
+    unsigned char *d = dial + (LUP_Y0 * DIAL_W + LUP_X0);
+    const unsigned char *s;
+    int i, j;
+
+    for (j = 0; j < LUP_H; j++, d += DIAL_W) {
+        if (j != 0 && lup_cy[j] == lup_cy[j - 1]) {
+            memcpy(d, d - DIAL_W, LUP_W);
+            continue;
+        }
+        s = fuente + lup_cy[j];
+        for (i = 0; i < LUP_W; i++)
+            d[i] = s[lup_cx[i]];
+    }
+}
+
+/* aro del cristal, un pixel por fuera de la lente (sin las esquinas, que
+   quedan redondeadas): claro arriba y a la izquierda, oscuro abajo y a
+   la derecha */
+static void aro(unsigned char *dial)
+{
+    unsigned char *d = dial + (LUP_RY0 * DIAL_W + LUP_RX0);
+    int j;
+
+    memset(d + 1, C_ARO1, LUP_RW - 2);
+    for (j = 1, d += DIAL_W; j < LUP_RH - 1; j++, d += DIAL_W) {
+        d[0] = C_ARO1;
+        d[LUP_RW - 1] = C_ARO2;
+    }
+    memset(d + 1, C_ARO2, LUP_RW - 2);
+}
+
+/* Puede alguna aguja del fotograma recien pintado verse bajo la lente?
+   Las franjas sucias lo dicen sin mirar un solo pixel (con un margen:
+   bajo el cristal la aguja se ve mas ancha que fuera) */
+static int lupa_toca(void)
+{
+    int y, y0 = LUP_RY0 - LUP_M, y1 = LUP_RY1 + LUP_M;
+
+    if (y0 < 0) y0 = 0;
+    if (y1 > DIAL_H - 1) y1 = DIAL_H - 1;
+    for (y = y0; y <= y1; y++)
+        if (cmax[y] >= LUP_RX0 - LUP_M && cmin[y] <= LUP_RX1 + LUP_M)
+            return 1;
+    return 0;
+}
+
+/* recompone la lente con las agujas: se devuelve a su sitio todo el
+   rectangulo (fecha ampliada y aro) desde la esfera, lo que borra las
+   agujas pintadas SIN aumento encima de la lente, y encima de la fecha se
+   vuelven a pintar el minutero y el segundero AMPLIADOS 5/2 en anchura
+   (la misma aguja, con el semiancho por 5/2 y recortada al interior de
+   la lente, de modo que su eje sigue en linea con la aguja de fuera).
+   Es vectorial: sin escalones de muestreo.  El horario no llega nunca
+   (R_AG_H queda a 3 pixeles de la lente) */
+static void lupa(unsigned a_m, unsigned a_s)
+{
+    unsigned char *m = MARCO  + (LUP_RY0 * DIAL_W + LUP_RX0);
+    const unsigned char *e = ESFERA + (LUP_RY0 * DIAL_W + LUP_RX0);
+    int y, s = SIN256[a_m], c = SIN256[a_m + 64];
+
+    for (y = LUP_RY0; y <= LUP_RY1; y++, m += DIAL_W, e += DIAL_W) {
+        memcpy(m, e, LUP_RW);
+        sucia(LUP_RX0, LUP_RX1, y);
+    }
+    clip_x0 = LUP_X0;  clip_x1 = LUP_X0 + LUP_W - 1;
+    clip_y0 = LUP_Y0;  clip_y1 = LUP_Y0 + LUP_H - 1;
+    baston(s, c, R_AG_M,     COL_M,     (HW_M * 5) >> 1,       C_OSC);
+    baston(s, c, R_AG_M - 2, COL_M - 2, ((HW_M - 2) * 5) >> 1, C_HI);
+    baston(s, c, R_AG_M - 4, COL_M - 4, ((HW_M - 4) * 5) >> 1, C_CLA);
+    baston(SIN256[a_s], SIN256[a_s + 64], R_AG_S, COL_S, 4, C_OSC);
+    clip_x0 = 0;  clip_x1 = DIAL_W - 1;
+    clip_y0 = 0;  clip_y1 = DIAL_H - 1;
+}
+
+/* ==================== fecha cocinada en la esfera ==================== */
+
+/* un digito 5x7 a escala 1 en la fuente de la lente (la lente se
+   encarga de agrandarlo) */
+static void digito(int x, int y, int v)
+{
+    const unsigned char *g = FUENTE[v];
+    unsigned char *d = lup_fuente + y * LUP_SW + x;
+    unsigned char m;
+    int f, b;
+
+    for (f = 0; f < DIG_ALTO; f++, d += LUP_SW)
+        for (b = 0, m = 0x80; b < DIG_W; b++, m >>= 1)
+            if (g[f] & m) d[b] = C_NEG;
+}
+
+/* dia del mes (sin cero inicial) bajo la lente, centrado.  Se cocina
+   UNA VEZ sobre la esfera limpia y a medianoche se vuelve a cocinar con
+   el dia nuevo. */
 static void pinta_fecha(int dia)
 {
-    int yd = VEN_YL + ((VEN_ALTO - 2 * DIG_ALTO) >> 1);
-    int y;
-
-    for (y = 0; y < VEN_ALTO; y++)
-        memset(ESFERA + (size_t)(VEN_YL + y) * DIAL_W + VEN_XL,
-               C_BLA, VEN_ANCHO);
+    memcpy(lup_fuente, lup_foto, sizeof(lup_fuente));
     if (dia < 10) {                     /* un digito, centrado */
-        digito(VEN_XL + ((VEN_ANCHO - 2 * DIG_W) >> 1), yd, dia);
+        digito(FEC_X1, FEC_Y, dia);
     } else {
-        int x0 = VEN_XL + ((VEN_ANCHO - (4 * DIG_W + 2)) >> 1);
         int dec = 0;
         while (dia >= 10) { dia -= 10; dec++; }   /* dia / 10 y dia % 10 */
-        digito(x0,                 yd, dec);
-        digito(x0 + 2 * DIG_W + 2, yd, dia);
+        digito(FEC_X2,             FEC_Y, dec);
+        digito(FEC_X2 + DIG_W + 1, FEC_Y, dia);
     }
+    lente(ESFERA, lup_fuente);
+    aro(ESFERA);
     sucio_todo();
 }
 
@@ -786,6 +927,13 @@ static void montar(void)
     d = pVideo + (size_t)DIAL_YF * VGA256_WIDTH + DIAL_XF;
     for (f = 0; f < DIAL_H; f++, e += DIAL_W, d += VGA256_WIDTH)
         memcpy(e, d, DIAL_W);
+
+    /* fondo de la ventanita tal como sale de la foto: es la fuente de la
+       lente antes de ponerle la fecha (la foto no trae lupa) */
+    e = ESFERA + (LUP_SY0 * DIAL_W + LUP_SX0);
+    d = lup_foto;
+    for (f = 0; f < LUP_SH; f++, e += DIAL_W, d += LUP_SW)
+        memcpy(d, e, LUP_SW);
 }
 
 /* paleta de 256 colores al DAC (6 bits: /4 como en el original; el
@@ -828,6 +976,7 @@ static void compone(unsigned a_h, unsigned a_m, unsigned a_s)
     baston2(a_m, R_AG_M, COL_M, HW_M);
     segundero(a_s);
     centro();
+    if (lupa_toca()) lupa(a_m, a_s);
 }
 
 /* vuelca a la VRAM lo que cambia: por fila, la union de las franjas del
@@ -866,41 +1015,23 @@ static void volcar(void)
    Solo se llama cuando cambia el tic.  Ademas de los tres angulos
    devuelve el PULSO del tic-tac: t256 >> 6, o sea 4 por segundo (el
    ritmo de un automatico a 14.400 alternancias/hora; los de 28.800
-   dan 8), que suena siempre que el pulso cambia. */
-static unsigned pit_frac(void)
-{
-    unsigned lo, hi, c;
-    outp(0x43, 0x00);
-    lo = (unsigned)inp(0x40);
-    hi = (unsigned)inp(0x40);
-    c = (hi << 8) | lo;
-    return (unsigned)(0xFFFFu - c);
-}
-
+   dan 8), que suena siempre que el pulso cambia.  (Ya no se lee el
+   contador del PIT para afinar dentro del tic: el BIOS lo programa en
+   modo 3 y su cuenta barre 65536..0 DOS veces por tic, y como esto se
+   llama justo al cambiar el tic, la fraccion salia casi siempre 0.) */
 static void angulos(unsigned long tk, unsigned *a_h, unsigned *a_m,
                     unsigned *a_s, unsigned long *pulso)
 {
     unsigned long t2k = tk * 2000UL;
     unsigned long s = t2k / 36413UL;
-    unsigned long sub = ((t2k - s * 36413UL) << 8) / 36413UL;
-    {
-        unsigned pf = pit_frac();
-        sub += ((unsigned long)pf * 14UL) >> 16;
-        if (sub > 255UL) {
-            sub -= 256UL;
-            s++;
-        }
-    }
-    {
-        unsigned long t256 = (s << 8) + sub;
-        unsigned long vs = t256 / 60UL;
-        unsigned long vm = vs / 60UL;
+    unsigned long t256 = (s << 8) + (((t2k - s * 36413UL) << 8) / 36413UL);
+    unsigned long vs = t256 / 60UL;
+    unsigned long vm = vs / 60UL;
 
-        *a_s = (unsigned)vs & 255u;
-        *a_m = (unsigned)vm & 255u;
-        *a_h = ((unsigned)vm / 12u) & 255u;
-        *pulso = t256 >> 6;
-    }
+    *a_s = (unsigned)vs & 255u;
+    *a_m = (unsigned)vm & 255u;
+    *a_h = ((unsigned)vm / 12u) & 255u;
+    *pulso = t256 >> 6;
 }
 
 int main(void)
@@ -933,6 +1064,7 @@ int main(void)
     /* paleta ANTES de blitear la foto, para que no asome ni un frame
        con la paleta por defecto del VBE */
     init_sincos();
+    init_lupa();
     pon_paleta();
 
     montar();
@@ -965,7 +1097,7 @@ int main(void)
         }
         tk_ant = tk;
         angulos(tk, &a_h, &a_m, &a_s, &pulso);
-        if (sonando && (tk - (unsigned long)sonando) >= 1UL) {
+        if (sonando) {                         /* un tic despues: a callar */
             callar();
             sonando = 0;
         }
@@ -974,8 +1106,7 @@ int main(void)
             if (opl) tic_tac(pulso);
             else {
                 pitido((unsigned)pulso);
-                sonando = (int)tk;
-                if (sonando == 0) sonando = 1;
+                sonando = 1;
             }
         }
         if (a_h == p_h && a_m == p_m && a_s == p_s) continue;  /* igual */

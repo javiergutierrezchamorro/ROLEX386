@@ -191,11 +191,15 @@ extern const unsigned char VGA256Font[];
  * expands them without a call.  Arguments must not have side effects
  * (same rule as VGA256OFFSET). */
 
+/* Fast byte-pattern fill: rep stosd main body + byte tail. Faster than
+ * memset on a 386 for the typical scanline widths. */
+void _VGA256Fill(void *pDest, unsigned char color, unsigned int len);
+
 #define VGA256LineH(pVideo, x, y, width, color) \
-	(memset(&VGA256OFFSET((pVideo), (x), (y)), (unsigned char)(color), (size_t)(width)))
+	(_VGA256Fill(&VGA256OFFSET((pVideo), (x), (y)), (unsigned char)(color), (unsigned int)(width)))
 
 #define VGA256ClearScreen(pVideo, color) \
-	(memset((void *)(pVideo), (unsigned char)(color), (size_t)VGA256_Pitch * (size_t)VGA256_HEIGHT))
+	(_VGA256Fill((void *)(pVideo), (unsigned char)(color), (size_t)VGA256_Pitch * (size_t)VGA256_HEIGHT))
 
 /* BDA keyboard buffer (0040:001A head / 0040:001C tail == linear 0x41A/0x41C
  * under DPMI 1:1).  Buffer itself sits at 0040:001E..003D (16 words, circular).
@@ -318,13 +322,6 @@ int VGA256LoadBMP(const char* filename, unsigned char* dest, unsigned char* pal)
 
 
 /*------------------------------------------------------------------------------------------------------- */
-/* Port I/O without conio: used by WaitVRetrace (status register 0x3DA). */
-static unsigned char VGA256InPort(unsigned short port);
-#pragma aux VGA256InPort = \
-"in al, dx" \
-parm [dx] \
-value [al] \
-modify exact [al];
 
 
 /*------------------------------------------------------------------------------------------------------- */
