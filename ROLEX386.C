@@ -887,9 +887,10 @@ static void montar(void)
 {
     const unsigned char *p   = FONDO_RLE;
     const unsigned char *fin = FONDO_RLE + FONDO_RLE_LEN;
-    unsigned char *d    = pVideo + (size_t)TIRA_Y * VGA256_WIDTH + TIRA_X;
+    unsigned pitch = VGA256_Pitch;       /* BytesPerScanline real, no 640 fijo */
+    unsigned char *d    = pVideo + (size_t)TIRA_Y * pitch + TIRA_X;
     unsigned char *fila = d + STRIP_W;       /* fin de la fila actual     */
-    unsigned char *ult  = d + (size_t)(TIRA_H - 1) * VGA256_WIDTH + STRIP_W;
+    unsigned char *ult  = d + (size_t)(TIRA_H - 1) * pitch + STRIP_W;
                                              /* fin de la ultima fila     */
     unsigned char *e = ESFERA;
     int f;
@@ -902,7 +903,7 @@ static void montar(void)
         if (n == 1u) {                  /* pixel suelto (el caso comun) */
             *d++ = v;
             if (d == fila) {
-                fila += VGA256_WIDTH;
+                fila += pitch;
                 d = fila - STRIP_W;
             }
             continue;
@@ -916,7 +917,7 @@ static void montar(void)
             d += q;
             n -= q;
             if (d == fila) {            /* fila completa: a la siguiente */
-                fila += VGA256_WIDTH;
+                fila += pitch;
                 d = fila - STRIP_W;
             }
         }
@@ -924,8 +925,8 @@ static void montar(void)
 
     /* esfera limpia (340x340): recorte del propio framebuffer lineal,
        como en el original */
-    d = pVideo + (size_t)DIAL_YF * VGA256_WIDTH + DIAL_XF;
-    for (f = 0; f < DIAL_H; f++, e += DIAL_W, d += VGA256_WIDTH)
+    d = pVideo + (size_t)DIAL_YF * pitch + DIAL_XF;
+    for (f = 0; f < DIAL_H; f++, e += DIAL_W, d += pitch)
         memcpy(e, d, DIAL_W);
 
     /* fondo de la ventanita tal como sale de la foto: es la fuente de la
@@ -989,10 +990,11 @@ static void volcar(void)
 {
     const int *pmin = suc_min[act ^ 1], *pmax = suc_max[act ^ 1];
     unsigned char *m = MARCO;
-    unsigned char *v = pVideo + (size_t)DIAL_YF * VGA256_WIDTH + DIAL_XF;
+    unsigned pitch = VGA256_Pitch;       /* BytesPerScanline real, no 640 fijo */
+    unsigned char *v = pVideo + (size_t)DIAL_YF * pitch + DIAL_XF;
     int y, x1, x2;
 
-    for (y = 0; y < DIAL_H; y++, m += DIAL_W, v += VGA256_WIDTH) {
+    for (y = 0; y < DIAL_H; y++, m += DIAL_W, v += pitch) {
         x1 = cmin[y]; if (pmin[y] < x1) x1 = pmin[y];
         x2 = cmax[y]; if (pmax[y] > x2) x2 = pmax[y];
         if (x2 >= x1) {
@@ -1058,6 +1060,14 @@ int main(void)
         VBE_SetMode(3, 0, 0);
         VBE_Done();
         cputs("ROLEX386: el DPMI no puede mapear la memoria de video.\r\n");
+        return 1;
+    }
+    /* las rutinas de volcado alinean a dword: el pitch debe ser multiplo
+       de 4 (con VGA256_Pitch declarado en vga256.h) */
+    if (VGA256_Pitch & 3) {
+        VBE_SetMode(3, 0, 0);
+        VBE_Done();
+        cputs("ROLEX386: el pitch del modo no es multiplo de 4.\r\n");
         return 1;
     }
 
