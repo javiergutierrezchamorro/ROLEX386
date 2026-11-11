@@ -321,11 +321,15 @@ static int act;
 static int *cmin = suc_min[0];
 static int *cmax = suc_max[0];
 
-/* margen 1 px contra rastros en diagonales */
+/* margen 1 px contra rastros en diagonales; se acota al dial para que
+   los memcpy alineados de compone/volcar nunca vean x negativos ni
+   fuera de [0, DIAL_W-1] */
 static void sucia(int x1, int x2, int y)
 {
     if (x1 > 0) x1--;
     if (x2 < DIAL_W - 1) x2++;
+    if (x1 < 0) x1 = 0;
+    if (x2 > DIAL_W - 1) x2 = DIAL_W - 1;
     if (x1 < cmin[y]) cmin[y] = x1;
     if (x2 > cmax[y]) cmax[y] = x2;
 }
@@ -660,10 +664,8 @@ static void pinta_fecha(int dia)
     if (dia < 10) {                     /* un digito, centrado */
         digito(FEC_X1, FEC_Y, dia);
     } else {
-        int dec = 0;
-        while (dia >= 10) { dia -= 10; dec++; }   /* dia / 10 y dia % 10 */
-        digito(FEC_X2,             FEC_Y, dec);
-        digito(FEC_X2 + DIG_W + 1, FEC_Y, dia);
+        digito(FEC_X2,             FEC_Y, dia / 10);
+        digito(FEC_X2 + DIG_W + 1, FEC_Y, dia % 10);
     }
     lente(ESFERA, lup_fuente);
     aro(ESFERA);
