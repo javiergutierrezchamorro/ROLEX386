@@ -295,19 +295,35 @@ static __inline void VGA256LineV(void *pVideo, unsigned int x, unsigned int y,
 	unsigned int h;
 	unsigned char *offset = (unsigned char *)&VGA256OFFSET(pVideo, x, y);
 	unsigned char c = (unsigned char)color;
+	/* Hoisted: the byte stores could alias the global, so the compiler would
+	 * otherwise reload VGA256_Pitch on every iteration. */
+	const unsigned int pitch = VGA256_Pitch;
 	for (h = 0; h < height; h++) {
 		*offset = c;
-		offset += VGA256_Pitch;
+		offset += pitch;
 	}
 }
 
 static __inline void VGA256DrawBox(void *pVideo, unsigned int x, unsigned int y,
                                    unsigned int width, unsigned int height, unsigned int color)
 {
-	VGA256LineV(pVideo, x, y, height + 1, color);
-	VGA256LineV(pVideo, x + width, y, height + 1, color);
+	unsigned char *pl, *pr;
+	unsigned int h;
+	unsigned char c = (unsigned char)color;
+	const unsigned int pitch = VGA256_Pitch;
+
+	/* Top and bottom edges: horizontal fills */
 	VGA256LineH(pVideo, x, y, width + 1, color);
 	VGA256LineH(pVideo, x, y + height, width + 1, color);
+	/* Both vertical edges in a single loop (corners written twice, same color) */
+	pl = (unsigned char *)pVideo + y * pitch + x;
+	pr = pl + width;
+	for (h = 0; h <= height; h++) {
+		*pl = c;
+		*pr = c;
+		pl += pitch;
+		pr += pitch;
+	}
 }
 
 void VGA256FillBox(void *pVideo, unsigned int x, unsigned int y, unsigned int width, unsigned int height, unsigned int color);
@@ -346,7 +362,7 @@ int VGA256LoadBMP(const char* filename, unsigned char* dest, unsigned char* pal)
 #pragma aux VGA256SetPalette = \
 "cld" \
 "mov ecx, 256 * 3" \
-"xor eax, eax" \
+"xor al, al" \
 "mov dx, 3c8h" \
 "out dx, al" \
 "inc dx" \
@@ -360,7 +376,7 @@ modify exact [esi edx ecx eax];
 #pragma aux VGA256GetPalette = \
 "cld" \
 "mov ecx, 256 * 3" \
-"xor eax, eax" \
+"xor al, al" \
 "mov dx, 3c7h" \
 "out dx, al" \
 "add dx, 2" \
@@ -380,6 +396,8 @@ void _VGA256MemCpy0(void *pDest, void *pSource, size_t iLen);
 "add esi, 4" \
 "test eax, eax" \
 "jz v0_adv" \
+"cmp eax, -1" \
+"je v0_w32" \
 "test al, al" \
 "jz v0_1" \
 "mov [edi], al" \
@@ -396,6 +414,9 @@ void _VGA256MemCpy0(void *pDest, void *pSource, size_t iLen);
 "test ah, ah" \
 "jz v0_adv" \
 "mov [edi+3], ah" \
+"jmp v0_adv" \
+"v0_w32:" \
+"mov [edi], eax" \
 "v0_adv:" \
 "add edi, 4" \
 "dec ecx" \
@@ -463,12 +484,123 @@ void VGA256MemCpySSE(char* Dest, char* Src, unsigned int Len);
 parm [edi] [esi] [ecx] \
 modify exact [eax ecx esi edi];
 
+/* Transparent block copy (colour-key 0) with MMX.  Each 8-byte block is
+ * classified first with its two dwords: or == 0 -> fully transparent (skip),
+ * and == -1 -> fully opaque (plain movq).  Only genuinely mixed blocks take
+ * the blend path, which is the only one that READS the destination.  This
+ * keeps VRAM destinations fast (no VRAM reads for opaque/transparent blocks,
+ * the common cases in a sprite). */
+void VGA256MemCpy0MMX(void *dst, const void *src, unsigned int len);
+#pragma aux VGA256MemCpy0MMX = \
+"push ecx" \
+"shr ecx, 3" \
+"jz m0m_tail" \
+"pxor mm7, mm7" \
+"m0m_lp:" \
+"movq mm0, [esi]" \
+"movq mm1, mm0" \
+"psrlq mm1, 32" \
+"movd eax, mm0" \
+"movd edx, mm1" \
+"and eax, edx" \
+"inc eax" \
+"jz m0m_full" \
+"movd eax, mm0" \
+"movd edx, mm1" \
+"or eax, edx" \
+"jz m0m_skip" \
+"movq mm2, [edi]" \
+"movq mm1, mm0" \
+"pcmpeqb mm1, mm7" \
+"pand mm1, mm2" \
+"por mm1, mm0" \
+"movq [edi], mm1" \
+"jmp m0m_next" \
+"m0m_full:" \
+"movq [edi], mm0" \
+"jmp m0m_next" \
+"m0m_skip:" \
+"m0m_next:" \
+"add esi, 8" \
+"add edi, 8" \
+"dec ecx" \
+"jnz m0m_lp" \
+"m0m_tail:" \
+"pop ecx" \
+"and ecx, 7" \
+"jz m0m_done" \
+"m0m_b:" \
+"mov al, [esi]" \
+"inc esi" \
+"test al, al" \
+"jz m0m_nb" \
+"mov [edi], al" \
+"m0m_nb:" \
+"inc edi" \
+"dec ecx" \
+"jnz m0m_b" \
+"m0m_done:" \
+"emms" \
+parm [edi] [esi] [ecx] \
+modify exact [eax ecx edx esi edi];
+
+/* Transparent block copy (colour-key 0) with SSE1.  Same block-classification
+ * design as the MMX version, 16 bytes per iteration: pmovmskb gives the
+ * zero-byte mask, 0 = fully opaque (store src, no destination read),
+ * 0xFFFF = fully transparent (skip), anything else = blend (the only path
+ * that reads the destination). */
+void VGA256MemCpy0SSE(void *dst, const void *src, unsigned int len);
+#pragma aux VGA256MemCpy0SSE = \
+"push ecx" \
+"shr ecx, 4" \
+"jz s0_tail" \
+"s0_lp:" \
+"movups xmm0, [esi]" \
+"pxor xmm1, xmm1" \
+"pcmpeqb xmm1, xmm0" \
+"pmovmskb eax, xmm1" \
+"test eax, eax" \
+"jz s0_full" \
+"cmp eax, 0ffffh" \
+"je s0_skip" \
+"movups xmm2, [edi]" \
+"pand xmm2, xmm1" \
+"por xmm2, xmm0" \
+"movups [edi], xmm2" \
+"jmp s0_next" \
+"s0_full:" \
+"movups [edi], xmm0" \
+"jmp s0_next" \
+"s0_skip:" \
+"s0_next:" \
+"add esi, 16" \
+"add edi, 16" \
+"dec ecx" \
+"jnz s0_lp" \
+"s0_tail:" \
+"pop ecx" \
+"and ecx, 15" \
+"jz s0_done" \
+"s0_b:" \
+"mov al, [esi]" \
+"inc esi" \
+"test al, al" \
+"jz s0_nb" \
+"mov [edi], al" \
+"s0_nb:" \
+"inc edi" \
+"dec ecx" \
+"jnz s0_b" \
+"s0_done:" \
+parm [edi] [esi] [ecx] \
+modify exact [eax ecx esi edi];
+
 /* Pattern fill with MMX: replicate color to 8 bytes, store 16 bytes/iter.
- * Color is kept in bl for the byte tail. */
+ * al still holds the color at the tail (nothing clobbers eax), so no
+ * save/restore of the color is needed. */
 void VGA256FillMMX(void *dst, unsigned char color, unsigned int len);
 #pragma aux VGA256FillMMX = \
 "cld" \
-"mov bl, al" \
 "mov ah, al" \
 "mov dx, ax" \
 "shl eax, 16" \
@@ -489,24 +621,23 @@ void VGA256FillMMX(void *dst, unsigned char color, unsigned int len);
 "mov ecx, edx" \
 "and ecx, 15" \
 "jz fm_done" \
-"mov al, bl" \
 "rep stosb" \
 "fm_done:" \
 parm [edi] [al] [ecx] \
-modify exact [eax ebx ecx edx edi];
+modify exact [eax ecx edx edi];
 
-/* Pattern fill with SSE1: replicate color across xmm0 via shufps, movups 16 bytes/iter.
- * Color is kept in bl for the byte tail. */
+/* Pattern fill with SSE1: replicate color across xmm0 with pinsrw (SSE1),
+ * movups 16 bytes/iter.  NOTE: "movd xmm0, eax" would be SSE2-only and would
+ * fault (#UD) on SSE1-but-not-SSE2 CPUs (Pentium III, Athlon XP).  eax keeps
+ * the color for the byte tail. */
 void VGA256FillSSE(void *dst, unsigned char color, unsigned int len);
 #pragma aux VGA256FillSSE = \
 "cld" \
-"mov bl, al" \
 "mov ah, al" \
-"mov dx, ax" \
-"shl eax, 16" \
-"mov ax, dx" \
-"movd xmm0, eax" \
-"shufps xmm0, xmm0, 0" \
+"pinsrw xmm0, eax, 0" \
+"pinsrw xmm0, eax, 1" \
+"pinsrw xmm0, eax, 2" \
+"pinsrw xmm0, eax, 3" \
 "mov edx, ecx" \
 "shr ecx, 4" \
 "jz fs_tail" \
@@ -519,11 +650,10 @@ void VGA256FillSSE(void *dst, unsigned char color, unsigned int len);
 "mov ecx, edx" \
 "and ecx, 15" \
 "jz fs_done" \
-"mov al, bl" \
 "rep stosb" \
 "fs_done:" \
 parm [edi] [al] [ecx] \
-modify exact [eax ebx ecx edx edi];
+modify exact [eax ecx edx edi];
 
 #ifdef __cplusplus
 }

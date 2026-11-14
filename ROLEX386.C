@@ -860,62 +860,61 @@ static void pon_banner(const char *msg)
 
 /* ==================== montaje de la imagen ==================== */
 
-/* Descompresion RLE del fondo DIRECTO a la VRAM lineal.  Los pixeles
-   son indices 0..63 (el DAC es de 6 bits: el indice es el nivel de
-   gris) y cada byte lleva el valor en los bits 0..5 y (cuenta-1) en los
-   bits 6..7:
+/* Descompresion RLE del fondo a un bufer RAM contiguo (no directo a la
+   VRAM).  Los pixeles son indices 0..63 (el DAC es de 6 bits: el indice
+   es el nivel de gris) y cada byte lleva el valor en los bits 0..5 y
+   (cuenta-1) en los bits 6..7:
        cuenta 1..3  el propio byte (bits 6..7 = 0, 1, 2)
        bits 6..7 = 3  racha de 4..255 pixeles: la cuenta va en el byte
                       siguiente
-   La foto es un tren lineal de pixeles y las rachas pueden cruzar el
-   borde de una fila de la franja, de ahi que el cursor se parta en los
-   bordes de fila al avanzar.  (Verificado: decodifica exactamente
-   STRIP_W x TIRA_H = 494 x 400 = 197.600 pixeles.) */
+   La foto es un tren lineal de pixeles: al ir a RAM contiguo las rachas
+   NO se parten en los bordes de fila (la franja se vuelca despues a la
+   VRAM con un memcpy por fila), y el lazo de decodificacion queda sin
+   logica de cruce de fila ni comprobacion de fila por pixel.  La esfera
+   limpia y lup_foto se recortan del propio bufer RAM, no del framebuffer
+   lineal: evita lecturas lentas del LFB (tipicamente no cacheable).
+   (Verificado: decodifica exactamente STRIP_W x TIRA_H = 494 x 400 =
+   197.600 pixeles.)  Coste: 197 KB de BSS en el modelo plano de 32 bits,
+   amortizable: el bufer solo se usa aqui. */
 static void montar(void)
 {
+    static unsigned char strip_ram[STRIP_W * TIRA_H];
     const unsigned char *p   = FONDO_RLE;
     const unsigned char *fin = FONDO_RLE + FONDO_RLE_LEN;
-    unsigned pitch = VGA256_Pitch;       /* BytesPerScanline real, no 640 fijo */
-    unsigned char *d    = pVideo + (size_t)TIRA_Y * pitch + TIRA_X;
-    unsigned char *fila = d + STRIP_W;       /* fin de la fila actual     */
-    unsigned char *ult  = d + (size_t)(TIRA_H - 1) * pitch + STRIP_W;
-                                             /* fin de la ultima fila     */
-    unsigned char *e = ESFERA;
+    unsigned char *s    = strip_ram;
+    unsigned char *sfin = strip_ram + (size_t)STRIP_W * TIRA_H;
+    unsigned pitch = VGA256_Pitch;
+    unsigned char *d, *e;
     int f;
 
-    while (p < fin && d < ult) {
+    /* RLE -> RAM contiguo: sin cruce de fila (memset directo) */
+    while (p < fin && s < sfin) {
         unsigned char v = *p++;
         unsigned n = (v >> 6) + 1u;     /* 1..3 pixeles, o 4 = cuenta aparte */
-        unsigned q;
 
         if (n == 1u) {                  /* pixel suelto (el caso comun) */
-            *d++ = v;
-            if (d == fila) {
-                fila += pitch;
-                d = fila - STRIP_W;
-            }
+            *s++ = v;
             continue;
         }
         if (n == 4u) n = *p++;
         v &= 63;
-        while (n > 0 && d < ult) {      /* la racha puede cruzar filas */
-            q = (unsigned)(fila - d);
-            if (q > n) q = n;
-            memset(d, v, q);
-            d += q;
-            n -= q;
-            if (d == fila) {            /* fila completa: a la siguiente */
-                fila += pitch;
-                d = fila - STRIP_W;
-            }
-        }
+        if (s + n > sfin) n = (unsigned)(sfin - s);
+        memset(s, v, n);
+        s += n;
     }
 
-    /* esfera limpia (340x340): recorte del propio framebuffer lineal,
-       como en el original */
-    d = pVideo + (size_t)DIAL_YF * pitch + DIAL_XF;
-    for (f = 0; f < DIAL_H; f++, e += DIAL_W, d += pitch)
-        memcpy(e, d, DIAL_W);
+    /* RAM -> VRAM: una fila por memcpy, avance por el pitch real */
+    d = pVideo + (size_t)TIRA_Y * pitch + TIRA_X;
+    s = strip_ram;
+    for (f = 0; f < TIRA_H; f++, d += pitch, s += STRIP_W)
+        memcpy(d, s, STRIP_W);
+
+    /* esfera limpia (340x340): recorte del bufer RAM.  El dial cae en la
+       franja en (DIAL_X-STRIP_X, DIAL_Y-STRIP_Y) = (64, 30). */
+    e = ESFERA;
+    s = strip_ram + (size_t)(DIAL_Y - STRIP_Y) * STRIP_W + (DIAL_X - STRIP_X);
+    for (f = 0; f < DIAL_H; f++, e += DIAL_W, s += STRIP_W)
+        memcpy(e, s, DIAL_W);
 
     /* fondo de la ventanita tal como sale de la foto: es la fuente de la
        lente antes de ponerle la fecha (la foto no trae lupa) */
