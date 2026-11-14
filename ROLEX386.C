@@ -1091,6 +1091,8 @@ int main(void)
         }
         if (tk < tk_ant) {                     /* cruzo la medianoche */
             pinta_fecha(lee_fecha());
+            p_h = 0xFFFFu;  /* fecha nueva: redibuja ya aunque las agujas
+                               queden en el mismo sitio que las anteriores */
         }
         tk_ant = tk;
         angulos(tk, &a_h, &a_m, &a_s, &pulso);

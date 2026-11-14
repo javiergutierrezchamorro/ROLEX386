@@ -178,7 +178,10 @@ extern VGA256_BlitCopyFn VGA256_BlitCopy;
 
 
 /*------------------------------------------------------------------------------------------------------- */
-#define VGA256PutScreen(pVideo, b) (memcpy(pVideo, b, (size_t)VGA256_Pitch * (size_t)VGA256_HEIGHT))
+/* Full-screen copy through the runtime blitter: memcpy before VBE_Init,
+ * MMX/SSE copy after it (VGA256_BlitCopy is initialized to the plain
+ * memcpy wrapper, so the macro is safe in any order). */
+#define VGA256PutScreen(pVideo, b) (VGA256_BlitCopy((pVideo), (b), (unsigned int)((size_t)VGA256_Pitch * (size_t)VGA256_HEIGHT)))
 #define _VGA256ABS(a) (((a) < 0) ? -(a) : (a))
 #define _VGA256Sgn(a) ((a) > 0 ? 1 : ((a) < 0 ? -1 : 0))
 
