@@ -78,13 +78,15 @@
  * BIOS se sigue leyendo de 0x46C; la cola del teclado del BIOS
  * tambien (0040:001A/001C == 0x41A/0x41C) y la VRAM de texto del
  * modo 3 (0xB8000), que usa la franja de salida.  El dia del mes sale
- * del DOS (int 21h AH=2Ah).  El teclado se sondea en el BDA (dos
- * lecturas de 16 bits) y solo se baja a la int 16h cuando hay tecla:
- * kbhit costaba una transicion al modo real del DPMI POR SONDEO; ahora
- * ademas solo se sondea al cambiar el tic (como mucho 55 ms de latencia).
- * Al salir (ESC) no se llama al DOS: el copyright se pinta DIRECTO en
- * la VRAM de texto (franja azul de 80 columnas en la fila 0, texto
- * blanco, cursor en (1, 0)): ni cputs ni int 29h.
+ * del DOS (int 21h AH=2Ah).  El teclado se sondea y se extrae TODO por
+ * la vga256 (VGA256KbHit / VGA256GetChNB): dos lecturas de 16 bits en
+ * el BDA para saber si hay tecla y un avance a mano de la cabeza del
+ * buffer para consumirla, SIN transicion al modo real del DPMI (antes
+ * se pagaba kbhit/lee_tecla, una int 16h POR SONDEO, miles de veces
+ * por segundo).  Ademas solo se sondea al cambiar el tic (como mucho
+ * 55 ms de latencia).  Al salir (ESC) no se llama al DOS: el copyright
+ * se pinta DIRECTO en la VRAM de texto (franja azul de 80 columnas en
+ * la fila 0, texto blanco, cursor en (1, 0)): ni cputs ni int 29h.
  *
  * Tic-tac: si hay un YM3812 (Adlib o Sound Blaster) en 388h, cuatro
  * veces por segundo sale un click FM (el tic algo mas agudo que el
@@ -116,11 +118,14 @@
  *   - Franjas sucias con margen 1 px.
  *   - Speaker apagado por delta de tics.
  *   - VGA256WaitVRetrace ya tiene timeout en vga256.c mejorado.
+ *   - Teclado por VGA256KbHit/VGA256GetChNB (BDA puro, sin int 16h):
+ *     cero transiciones al modo real por sondeo.
+ *   - Salida y errores por pon_banner (VRAM de texto directa, sin cputs).
  */
 
 
 #include <string.h>   /* memcpy, memset                 */
-#include <conio.h>    /* cputs (errores), inp/outp      */
+#include <conio.h>    /* inp, outp                      */
 #include <dos.h>      /* union REGS, int386             */
 
 
@@ -696,31 +701,15 @@ static int lee_fecha(void)
 
 /* ==================== teclado: cola del BIOS en el BDA ==================== */
 
-/* El bucle principal sondea la cola del teclado directamente en el BDA
-   (0040:001A cabeza / 0040:001C cola == lineal 0x41A/0x41C por el
-   mapeo 1:1 del primer megabyte): dos lecturas de 16 bits y nada mas.
-   Antes se pagaba kbhit (una int 16h, con su transicion al modo real
-   del DPMI) POR SONDEO, miles de veces por segundo.  Cuando HAY tecla
-   se extrae con la int 16h AH=00h, que devuelve ASCII y deja al BIOS
-   como dueno del teclado.  El puerto 60h no compensa: el IRQ1 del
-   BIOS sigue leyendo el controlador hacia la misma cola (habria que
-   quitarle el IRQ1 para no duplicar o perder teclas), hay que
-   separar make de break y prefijos E0 y traducir el scancode, y no se
-   gana nada sobre dos lecturas de memoria.  (Con la cola llena tambien
-   cabeza==cola: el caso esquina de siempre, que el BIOS ya pita.) */
-static int hay_tecla(void)
-{
-    volatile unsigned short *bda = (volatile unsigned short *)0x41Aul;
-    return bda[0] != bda[1];              /* cabeza != cola */
-}
-
-static int lee_tecla(void)
-{
-    union REGS r;
-    r.h.ah = 0x00;                        /* int 16h AH=00h: extraer */
-    int386(0x16, &r, &r);
-    return (int)(unsigned char)r.h.al;     /* ASCII (0 si extendida) */
-}
+/* El bucle principal sondea y extrae el teclado por la vga256, TODO en
+   el BDA (0040:001A cabeza / 0040:001C cola == lineal 0x41A/0x41C por
+   el mapeo 1:1 del primer megabyte): VGA256KbHit mira cabeza != cola
+   (y un scan extendido pendiente) y VGA256GetChNB lee la palabra del
+   buffer y avanza la cabeza a mano.  Cero transiciones al modo real del
+   DPMI por sondeo (antes se pagaba kbhit/lee_tecla, una int 16h POR
+   SONDEO, miles de veces por segundo).  Las teclas extendidas (ASCII 0)
+   se devuelven en dos llamadas como hace conio: 0 primero, scan despues.
+   Solo se sondea al cambiar el tic (como mucho 55 ms de latencia). */
 
 /* ==================== tic-tac FM (Adlib / Sound Blaster) ==================== */
 
@@ -841,19 +830,19 @@ static void callar(void)
 
 /* ==================== salida: franja en la VRAM de texto ==================== */
 
-/* Al salir (ESC) no se llama al DOS: la salida se pinta DIRECTO en la
-   VRAM de texto del modo 3 (0xB8000, mapeada 1:1 bajo DPMI), como
-   franja de las 80 columnas completas de la fila 0, atributo 0x1F
-   (fondo azul, texto blanco) y rellena con espacios; luego se coloca
-   el cursor en la fila 1, columna 0 con la int 10h AH=02h.  El modo 3
-   ya lo ha limpiado todo el BIOS.  \x82 = e con acento en
-   CP437/CP850 (el fuente va en UTF-8). */
-static void franja_salida(void)
+/* Escribe el mensaje DIRECTO en la VRAM de texto del modo 3
+   (0xB8000, mapeada 1:1 bajo DPMI), como franja de las 80 columnas
+   completas de la fila 0, atributo 0x1F (fondo azul, texto blanco) y
+   rellena con espacios; luego coloca el cursor en la fila 1, columna 0
+   con la int 10h AH=02h.  Vale para el copyright al salir (ESC) y para
+   los avisos de error antes de salir (los dos con el reloj apagado, en
+   modo texto de 80x25).  Sin cputs ni int 21h: 80 palabras y una sola
+   int 10h.  \x82 = e con acento en CP437/CP850 (el fuente va en UTF-8). */
+static void pon_banner(const char *msg)
 {
-    static const char MENSAJE[] =
-        " ROLEX386 v2 (c) Copyright 2026 by Javier Guti\x82rrez Chamorro (Guti) ";
     volatile unsigned short *v = (volatile unsigned short *)0xB8000ul;
-    const char *p = MENSAJE;
+    const char *p = msg;
+    union REGS r;
     int i;
 
     for (i = 0; i < 80; i++) {
@@ -862,14 +851,11 @@ static void franja_salida(void)
         else c = ' ';
         v[i] = (unsigned short)((0x1F << 8) | c);
     }
-    {
-        union REGS r;
-        r.h.ah = 0x02;                    /* colocar el cursor       */
-        r.h.bh = 0;                       /* pagina 0                */
-        r.h.dh = 1;                       /* fila 1                  */
-        r.h.dl = 0;                       /* columna 0               */
-        int386(0x10, &r, &r);
-    }
+    r.h.ah = 0x02;                    /* colocar el cursor       */
+    r.h.bh = 0;                       /* pagina 0                */
+    r.h.dh = 1;                       /* fila 1                  */
+    r.h.dl = 0;                       /* columna 0               */
+    int386(0x10, &r, &r);
 }
 
 /* ==================== montaje de la imagen ==================== */
@@ -1047,13 +1033,13 @@ int main(void)
     int sonando = 0;                    /* 1 = el altavoz sigue encendido (fallback) */
 
     if (!VBE_Init()) {
-        cputs("ROLEX386: no hay BIOS SVGA VESA (VBE).\r\n");
+        pon_banner("ROLEX386: no hay BIOS SVGA VESA (VBE).");
         return 1;
     }
     modo = VBE_FindMode(VGA256_WIDTH, VGA256_HEIGHT, 8);
     if (modo < 0 || !VBE_IsModeLinear(modo)) {
         VBE_Done();
-        cputs("ROLEX386: se necesita un modo lineal VGA256 (640x400x256).\r\n");
+        pon_banner("ROLEX386: se necesita un modo lineal VGA256 (640x400x256).");
         return 1;
     }
     VBE_SetMode(modo, 1, 1);              /* lineal y limpiar pantalla */
@@ -1061,7 +1047,7 @@ int main(void)
     if (pVideo == NULL) {
         VBE_SetMode(3, 0, 0);
         VBE_Done();
-        cputs("ROLEX386: el DPMI no puede mapear la memoria de video.\r\n");
+        pon_banner("ROLEX386: el DPMI no puede mapear la memoria de video.");
         return 1;
     }
     /* las rutinas de volcado alinean a dword: el pitch debe ser multiplo
@@ -1069,7 +1055,7 @@ int main(void)
     if (VGA256_Pitch & 3) {
         VBE_SetMode(3, 0, 0);
         VBE_Done();
-        cputs("ROLEX386: el pitch del modo no es multiplo de 4.\r\n");
+        pon_banner("ROLEX386: el pitch del modo no es multiplo de 4.");
         return 1;
     }
 
@@ -1094,12 +1080,12 @@ int main(void)
     for (;;) {
         tk = lee_ticks();
         if (tk == tk_ant) continue;            /* mismo tic: nada que hacer */
-        while (hay_tecla()) {                  /* el teclado, una vez por tic */
-            if (lee_tecla() == 27) {     /* ESC -> salir */
+        while (VGA256KbHit()) {                /* el teclado, una vez por tic */
+            if (VGA256GetChNB() == 27) {   /* ESC -> salir */
                 if (opl) opl_silencio(); else callar();   /* que no quede sonido */
                 VBE_SetMode(3, 0, 0);
                 VBE_Done();
-                franja_salida();         /* franja azul/blanco en la fila 0 */
+                pon_banner(" ROLEX386 v2 (c) Copyright 2026 by Javier Guti\x82rrez Chamorro (Guti) ");
                 return 0;
             }
             /* cualquier otra tecla se descarta del buffer */
